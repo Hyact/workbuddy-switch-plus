@@ -12,7 +12,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, MIB_TCP_STATE_LISTEN, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::Networking::WinSock::AF_INET;
 use windows_sys::Win32::System::Threading::{
@@ -71,9 +71,10 @@ pub fn listening_pids(port: u16) -> Vec<u32> {
     let mut found = Vec::new();
     for index in 0..entries {
         let row = unsafe { &*rows.add(index) };
-        if row.dwState != MIB_TCP_STATE_LISTEN as u32 {
-            continue;
-        }
+        // `TCP_TABLE_OWNER_PID_LISTENER` 本身已经只返回监听中的 socket，无需再按
+        // `dwState` 过滤。部分 Windows 上这张表里的监听项 `dwState` 是 0 而不是
+        // `MIB_TCP_STATE_LISTEN`(2)，再过滤会让 `listening_pids` 永远为空，
+        // 于是「停止服务」按端口反查不到监听者（外部启动/Onefile 子进程都会失败）。
         // dwLocalPort 是网络字节序，低 16 位里是高字节在前。
         let local = u16::from_be((row.dwLocalPort & 0xFFFF) as u16);
         if local != port {
