@@ -163,7 +163,7 @@ class CredentialManager:
         headers = self._build_headers_from(auth, s.get("account") or {})
         headers["X-Refresh-Token"] = decrypt_auth_field(auth.get("refreshToken", ""))
         headers["X-Auth-Refresh-Source"] = "plugin"
-        url = f"{BACKEND}/v2/plugin/auth/token/refresh"
+        url = f"{_backend_base_of(self)}/v2/plugin/auth/token/refresh"
         try:
             with httpx.Client(timeout=15) as c:
                 r = c.post(url, headers=headers, json={})
@@ -237,6 +237,10 @@ class CredentialManager:
             "enterpriseName": acct.get("enterpriseName"),
             "token_expires_at": exp,
             "token_expired": self._is_expired(),
+            # 端点分域要靠这两项：`_realm_of_credential` 只认 realm/domain，
+            # 缺了它们国际版账号会被一律当成国内版（打错网关 → 401）。
+            "realm": s.get("realm") or auth.get("realm") or auth.get("variant"),
+            "domain": auth.get("domain"),
         }
 
 
@@ -595,6 +599,37 @@ def _realm_of_credential(cred) -> str:
         return realm_mod.realm_of(auth)
     except ImportError:
         return "cn"
+
+
+def _backend_base_of(cred) -> str:
+    """按凭据所属版本取上游 base。
+
+    为什么必须分域：两版网关只认自己签发的 token。国际版 token 打到
+    `copilot.tencent.com` 会被 openresty 直接回 401 HTML 错误页，国内版
+    token 打到 `www.workbuddy.ai` 同样 401 —— 现象一致，都是「账号看起来
+    正常、一用就废」。`realm.chat_base()` 早就写好了，chat 转发此前没接上。
+    """
+    try:
+        from admin import realm as realm_mod
+        return realm_mod.chat_base(_realm_of_credential(cred))
+    except ImportError:
+        return BACKEND
+
+
+def _ua_of(cred) -> str:
+    """按版本取 User-Agent。
+
+    国际版网关会校验渠道形态（UA 平台段必须是 `WorkBuddy AI`），
+    国内版沿用原 UA —— 不动它，避免把已经在跑的国内链路改坏。
+    """
+    try:
+        from admin import realm as realm_mod
+        realm = _realm_of_credential(cred)
+        if realm_mod.norm_realm(realm) != realm_mod.GLOBAL:
+            return USER_AGENT
+        return realm_mod._ua(realm)
+    except (ImportError, AttributeError):
+        return USER_AGENT
 
 
 def _envelope_of(resp):
@@ -1105,7 +1140,7 @@ async def chat_completions(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{_backend_base_of(cred)}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
@@ -1527,7 +1562,7 @@ async def create_response(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{_backend_base_of(cred)}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
@@ -1706,7 +1741,7 @@ async def create_message(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{_backend_base_of(cred)}/v2/chat/completions"
     t0 = time.time()
 
     # 如果用户请求流式响应，直接返回流式
@@ -1890,7 +1925,7 @@ async def count_tokens(
         )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{_backend_base_of(cred)}/v2/chat/completions"
 
     try:
         async with httpx.AsyncClient(timeout=30.0, **_proxy_kwargs()) as client:

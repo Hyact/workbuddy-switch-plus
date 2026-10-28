@@ -265,7 +265,7 @@ class SwitchCredentialManager:
         headers = self._build_headers_from(auth, s.get("account") or {})
         headers["X-Refresh-Token"] = decrypt_auth_field(auth.get("refreshToken", ""))
         headers["X-Auth-Refresh-Source"] = "plugin"
-        url = f"{BACKEND}/v2/plugin/auth/token/refresh"
+        url = f"{converter._backend_base_of(self)}/v2/plugin/auth/token/refresh"
         try:
             with httpx.Client(timeout=15) as c:
                 r = c.post(url, headers=headers, json={})
@@ -331,6 +331,11 @@ class SwitchCredentialManager:
             "enterpriseName": acct.get("enterpriseName"),
             "token_expires_at": exp,
             "token_expired": self._is_expired(),
+            # 端点分域要靠这两项：`_realm_of_credential` 只认 realm/domain，
+            # 缺了它们国际版账号会被一律当成国内版（打错网关 → 401）。
+            # `record_to_doc` 已经把版本算成 realm 了，这里只是把它带出来。
+            "realm": s.get("realm") or auth.get("realm") or auth.get("variant"),
+            "domain": auth.get("domain"),
         }
 
 
