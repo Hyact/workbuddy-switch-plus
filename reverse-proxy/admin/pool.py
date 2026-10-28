@@ -695,6 +695,14 @@ class AccountPool:
                 candidates = [row for row in candidates if row["id"] == self.store.data["active"]]
                 if not candidates:
                     raise HTTPException(503, "当前账号不可用：请在账号池里换一个账号，或改回轮流使用")
+            # 国际版账号默认不进对话轮转：workbuddy.ai 网关对非官方客户端做
+            # 「渠道校验」，一律回 11128「这次调用没通过渠道校验，可能不是官方
+            # 客户端发出的」。放进轮转只会走成「选中 → 401/11128 → 冷却 5 分钟
+            # → 这次请求失败」，还把本来能用的国内号挤掉了。
+            # 积分与签到不受影响（各自按 realm 分域走 billing）。
+            # 想放回来：把 state.json 里 pool.chat_include_global 设为 true。
+            if not self.store.data["pool"].get("chat_include_global"):
+                candidates = [row for row in candidates if row.get("realm") != "global"]
             if not candidates:
                 raise HTTPException(503, "暂无可用账号：请检查暂停、积分、冷却或登录状态")
             now = self.clock()
