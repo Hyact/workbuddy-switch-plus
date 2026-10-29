@@ -21,7 +21,7 @@ _OBLIGATION = re.compile(
     r"operating|working|running|using|to)\b", re.IGNORECASE
 )
 _HEADINGS = re.compile(
-    r"^#{1,6}\s+(?:ZCode|Codex|Claude Code|CodeBuddy|WorkBuddy|OpenCode)\s+",
+    r"^#{1,6}\s+(?:ZCode|Codex|Claude Code|CodeBuddy|WorkBuddy|OpenCode|DeepSeek(?:\s+Harness)?)\s+",
     re.IGNORECASE,
 )
 _BRANCH_TEMPLATE = re.compile(

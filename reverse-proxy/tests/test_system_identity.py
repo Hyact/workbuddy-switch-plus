@@ -48,6 +48,70 @@ def test_identity_only_system_is_removed():
                                                {'role': 'user', 'content': 'hello'}]})['messages'] == [{'role': 'user', 'content': 'hello'}]
 
 
+def test_deepseek_heading_is_stripped():
+    """DeepSeek harness 标题式标记（# DeepSeek Harness ...）被清除，正文保留。"""
+    text = '# DeepSeek Harness v1.0\nFollow repository rules.\n'
+    result = filter_system_text(text)
+    assert 'DeepSeek' not in result
+    assert 'Follow repository rules.' in result
+
+
+def test_deepseek_heading_variants():
+    for heading in ('# DeepSeek Harness', '## DeepSeek Coding Agent', '# DeepSeek '):
+        text = heading + '\nKeep rules.\n'
+        result = filter_system_text(text)
+        assert 'DeepSeek' not in result, f"heading not stripped: {heading}"
+        assert 'Keep rules.' in result
+
+
+def test_harness_fingerprint_scramble_keeps_meaning():
+    """上游按固定 prompt 指纹判定渠道（11128）；打散后必须保留 @ 语义。"""
+    from core.converter import _scramble_harness_fingerprint
+
+    body = {
+        'messages': [
+            {
+                'role': 'system',
+                'content': (
+                    'Tokens prefixed with @ are paths the user explicitly referenced. '
+                    'Relative paths resolve from the workspace root.'
+                ),
+            },
+            {'role': 'user', 'content': 'untouched text'},
+        ]
+    }
+    out = _scramble_harness_fingerprint(body)
+    system_text = out['messages'][0]['content']
+    assert system_text.startswith('Entries prefixed with @')
+    assert 'project root' in system_text
+    assert 'workspace root' not in system_text
+    # @ 语义和真正的内容不得被改动
+    assert '@' in system_text
+    assert out['messages'][1]['content'] == 'untouched text'
+    # 原始 body 不被就地修改
+    assert body['messages'][0]['content'].startswith('Tokens prefixed with @')
+
+
+def test_harness_fingerprint_scramble_handles_block_content():
+    from core.converter import _scramble_harness_fingerprint
+
+    body = {
+        'messages': [
+            {
+                'role': 'system',
+                'content': [
+                    {'type': 'text', 'text': 'Tokens prefixed with @ mean paths.'},
+                    {'type': 'image', 'source': {'data': 'x'}},
+                ],
+            }
+        ]
+    }
+    out = _scramble_harness_fingerprint(body)
+    blocks = out['messages'][0]['content']
+    assert blocks[0]['text'].startswith('Entries prefixed with @')
+    assert blocks[1] == {'type': 'image', 'source': {'data': 'x'}}
+
+
 @pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/responses', '/v1/messages'])
 def test_routes_filter_system_but_preserve_harness_user(monkeypatch, path):
     import asyncio
@@ -83,6 +147,7 @@ def test_routes_filter_system_but_preserve_harness_user(monkeypatch, path):
             assert response.status_code == 200
     asyncio.run(run())
     messages = captured[0]['messages']
+    # user 消息不属于身份声明，必须逐字保留（含其中的品牌字样）
     assert [m['content'] for m in messages if m['role'] == 'user'] == [user]
     system_text = '\n'.join(m['content'] for m in messages if m['role'] == 'system')
     assert 'ZCode' not in system_text

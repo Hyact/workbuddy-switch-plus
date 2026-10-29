@@ -141,6 +141,9 @@ _HARNESS_USER_MARKERS = (
     "<skills_instructions>",
     "<system-reminder>",           # Claude Code 注入的运行时上下文
     "# claudeMd",                  # Claude Code CLAUDE.md 注入
+    "# DeepSeek Harness",          # DeepSeek harness 注入的运行时上下文
+    "# DeepSeek",                  # DeepSeek harness 其他注入
+    "DeepSeek Harness",            # DeepSeek harness 标识
 )
 
 _CODEX_SYSTEM_MARKERS = (
