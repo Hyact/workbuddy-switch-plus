@@ -65,3 +65,50 @@ def test_build_headers_from_encrypted_auth(tmp_path, monkeypatch):
     h = cm.get_headers()
     assert h["Authorization"] == "Bearer access-token-plain"
     assert h["X-User-Id"] == "u1"
+
+
+def test_get_headers_includes_channel_gate_headers(tmp_path):
+    """get_headers() 合并渠道风控头（X-CodeBuddy-Request / 官方 UA / Origin 等）。"""
+    from core.converter import CredentialManager
+
+    session = {
+        "auth": {
+            "accessToken": "tok",
+            "domain": "www.codebuddy.cn",
+            "expiresAt": 9999999999999,
+        },
+        "account": {"uid": "u1", "enterpriseId": "e1"},
+    }
+    f = tmp_path / "workbuddy-desktop.info"
+    f.write_text(json.dumps(session), encoding="utf-8")
+    cm = CredentialManager(f)
+    h = cm.get_headers()
+    assert h["X-CodeBuddy-Request"] == "1"
+    assert h["X-Requested-With"] == "XMLHttpRequest"
+    assert "WorkBuddy" in h["User-Agent"]
+    assert h["Origin"] == "https://www.codebuddy.cn"
+    assert h["Referer"] == "https://www.codebuddy.cn/"
+    assert "X-Machine-ID" in h
+    assert "X-Session-ID" in h
+    assert h["Authorization"] == "Bearer tok"
+    assert h["X-User-Id"] == "u1"
+
+
+def test_refresh_headers_keep_plugin_ua(tmp_path):
+    """token 刷新路径（_build_headers_from）保留 plugin UA，不混入渠道头。"""
+    from core.converter import CredentialManager
+
+    session = {
+        "auth": {
+            "accessToken": "tok",
+            "domain": "www.codebuddy.cn",
+            "expiresAt": 9999999999999,
+        },
+        "account": {"uid": "u1", "enterpriseId": "e1"},
+    }
+    f = tmp_path / "workbuddy-desktop.info"
+    f.write_text(json.dumps(session), encoding="utf-8")
+    cm = CredentialManager(f)
+    h = cm._build_headers_from(session["auth"], session["account"])
+    assert h["User-Agent"] == "codebuddy2openai/2.0"
+    assert "X-CodeBuddy-Request" not in h

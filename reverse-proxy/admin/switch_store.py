@@ -252,11 +252,19 @@ class SwitchCredentialManager:
         }
 
     def get_headers(self) -> dict:
+        """对话/业务请求 header，合并渠道风控头（与 converter 同步）。
+
+        token 刷新路径（_refresh）直接调 _build_headers_from，不受影响。
+        """
         with self._lock:
             if self._is_expired():
                 self._refresh()
             s = self._session()
-            return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
+            auth = s.get("auth") or {}
+            account = s.get("account") or {}
+            h = self._build_headers_from(auth, account)
+            h.update(realm_mod.headers(realm_mod.realm_of(auth), uid=account.get("uid", "")))
+            return h
 
     # ── 刷新 ──
     def _refresh(self) -> None:

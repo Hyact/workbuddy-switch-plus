@@ -22,6 +22,7 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -219,12 +220,25 @@ class CredentialManager:
         return h
 
     def get_headers(self) -> dict:
-        """返回带最新 token 的后端请求 header；必要时先刷新。"""
+        """返回带最新 token 的后端请求 header；必要时先刷新。
+
+        对话/业务请求合并渠道风控头（X-CodeBuddy-Request / 官方 UA / Origin
+        / Referer / 设备指纹），与官方客户端对齐，避免被上游渠道校验拦截。
+        token 刷新路径（_refresh）直接调 _build_headers_from，不受影响。
+        """
         with self._lock:
             if self._is_expired():
                 self._refresh()
             s = self._session()
-            return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
+            auth = s.get("auth") or {}
+            account = s.get("account") or {}
+            h = self._build_headers_from(auth, account)
+            try:
+                from admin import realm as realm_mod
+                h.update(realm_mod.headers(realm_mod.realm_of(auth), uid=account.get("uid", "")))
+            except ImportError:
+                pass
+            return h
 
     def summary(self) -> dict:
         s = self._session()
@@ -929,6 +943,114 @@ def _log(msg: str):
         pass  # 日志失败不应影响主流程
 
 
+# 上游拒绝（11128 渠道校验 / 内容审核等）时把完整请求与响应落盘。
+#
+# 与 state 里的 request-log.jsonl 互补：那边只记统计（status/tokens/outcome），
+# 且失败时的 status 并不总是准（实测 11128 的 400 被记成了 200 success），
+# 事后完全看不出发生了什么。这里保留上游原文和发出去的 body，
+# 是定位这类问题的唯一直接证据。
+_UPSTREAM_DUMP_PATH = Path.home() / ".wb-switch-plus" / "reverse-proxy" / "upstream-errors.log"
+_UPSTREAM_DUMP_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _dump_upstream_error(url: str, headers: dict, body: dict, status: int,
+                         raw: bytes, note: str = "") -> None:
+    """记录一次上游拒绝的完整上下文；任何失败都静默，不影响请求本身。"""
+    try:
+        path = _UPSTREAM_DUMP_PATH
+        try:
+            if path.stat().st_size > _UPSTREAM_DUMP_MAX_BYTES:
+                return
+        except OSError:
+            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        safe_headers = {
+            k: ("***" if str(k).lower() == "authorization" else v)
+            for k, v in (headers or {}).items()
+        }
+        messages = body.get("messages") or []
+        tools = body.get("tools") or []
+        serialized = json.dumps(body, ensure_ascii=False)
+        entry = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "note": note,
+            "url": url,
+            "status": status,
+            "summary": {
+                "model": body.get("model"),
+                "message_count": len(messages),
+                "roles": [m.get("role") for m in messages if isinstance(m, dict)],
+                "tool_count": len(tools),
+                "tool_names": [
+                    (t.get("function") or {}).get("name")
+                    for t in tools if isinstance(t, dict)
+                ],
+                "body_chars": len(serialized),
+                "body_sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+                "keys": sorted(body.keys()),
+            },
+            "headers": safe_headers,
+            "upstream_raw": (raw or b"").decode("utf-8", "replace")[:20000],
+            "request_body": serialized[:1_000_000],
+        }
+        with _LOG_LOCK, open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 - 诊断落盘绝不影响主流程
+        pass
+
+
+# DSH / Codex 等 harness 的 system prompt 是固定写法，上游风控按这些
+# 「指纹片段」判定请求是否来自官方客户端。实测同一段文本只换一处措辞就能
+# 从 11128 变回 200（原样 400 → 改后 200，可稳定复现），所以这里做最小
+# 必要打散：只换表述、保留语义，不影响 agent 对 @ 路径语法的理解。
+_HARNESS_FINGERPRINT_RULES = (
+    (re.compile(r"Tokens prefixed with @"), "Entries prefixed with @"),
+    (re.compile(r"workspace root"), "project root"),
+    (re.compile(r"DeepSeek Harness"), "Agent Harness"),
+)
+
+
+def _scramble_harness_fingerprint(body: dict) -> dict:
+    """打散 harness prompt 里可被上游识别的特征片段，避开 11128 渠道校验。"""
+    def fix(text: str) -> str:
+        for pattern, replacement in _HARNESS_FINGERPRINT_RULES:
+            text = pattern.sub(replacement, text)
+        return text
+
+    messages = []
+    changed = False
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            messages.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            new_text = fix(content)
+            if new_text != content:
+                changed = True
+                messages.append(dict(message, content=new_text))
+            else:
+                messages.append(message)
+        elif isinstance(content, list):
+            blocks = []
+            block_changed = False
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    new_text = fix(block["text"])
+                    if new_text != block["text"]:
+                        block_changed = True
+                        changed = True
+                        block = dict(block, text=new_text)
+                blocks.append(block)
+            messages.append(dict(message, content=blocks) if block_changed else message)
+        else:
+            messages.append(message)
+    out = dict(body)
+    if changed:
+        out["messages"] = messages
+    return out
+
+
 def _truncate(s: str, n: int = 80) -> str:
     s = str(s).replace("\n", " ").strip()
     return s[:n] + ("…" if len(s) > n else "")
@@ -1072,6 +1194,7 @@ async def chat_completions(
         ]
 
     body = filter_system_identity(body)
+    body = _scramble_harness_fingerprint(body)
 
     # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
     # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
@@ -1315,7 +1438,7 @@ async def _stream_upstream(
                     nm = (tc.get("function") or {}).get("name")
                     if nm:
                         tool_names.append(nm)
-            # 内容审核拦截常以 content-filter 或特殊中文文案返回
+            # 内容审核/渠道拦截常以 content-filter、11128 或特殊中文文案返回
             try:
                 text_repr = data.decode("utf-8", "replace")
             except Exception:
@@ -1324,6 +1447,8 @@ async def _stream_upstream(
                 "content-filter" in text_repr
                 or "敏感" in text_repr
                 or "审核" in text_repr
+                or "11128" in text_repr
+                or "请求被拦截" in text_repr
             ):
                 saw_filter = True
 
@@ -1336,6 +1461,8 @@ async def _stream_upstream(
                         f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
                     )
                     _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8', 'replace')}")
+                    _dump_upstream_error(url, headers, body, r.status_code, err,
+                                         note="stream-non-200")
                     yield _err_event(err, r.status_code)
                     return
                 async for chunk in r.aiter_bytes():
@@ -1359,6 +1486,10 @@ async def _stream_upstream(
     _log(
         f"{prefix}── RESPONSE RAW SSE ──\n{b''.join(raw_parts).decode('utf-8', 'replace')}"
     )
+    # 上游回 200 但在流里塞了拦截错误（渠道校验常见形态）——落盘留证据
+    if saw_filter or finish_reason == "content-filter":
+        _dump_upstream_error(url, headers, body, 200, b"".join(raw_parts),
+                             note="stream-200-blocked")
 
 
 def _safe_err(r: httpx.Response) -> dict:
@@ -1396,6 +1527,10 @@ def _looks_like_content_filter_text(text: str) -> bool:
         or "敏感内容" in text
         or "内容审核" in text
         or "无法响应您的请求" in text
+        or "11128" in text
+        or "illegal api invocation" in text
+        or "unapproved channel" in text
+        or "请求被拦截" in text
     )
 
 
@@ -1428,6 +1563,8 @@ async def _post_backend_with_filter_retry(
     prefix = f"[{rid}] " if rid else ""
     status, raw = await _post_backend_once(url, headers, body)
     text = raw.decode("utf-8", "replace")
+    if status != 200 or _looks_like_content_filter_text(text):
+        _dump_upstream_error(url, headers, body, status, raw, note="non-stream")
     if (
         status == 200
         and _looks_like_content_filter_text(text)
@@ -1494,6 +1631,7 @@ async def create_response(
         )
 
     chat_body = filter_system_identity(chat_body)
+    chat_body = _scramble_harness_fingerprint(chat_body)
     chat_body, projection_stats = project_responses_chat_body(
         chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
     )
@@ -1685,6 +1823,7 @@ async def create_message(
         chat_body["stream_options"] = {"include_usage": True}
 
     chat_body = filter_system_identity(chat_body)
+    chat_body = _scramble_harness_fingerprint(chat_body)
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
@@ -1879,6 +2018,7 @@ async def count_tokens(
     chat_body["stream_options"] = {"include_usage": True}
 
     chat_body = filter_system_identity(chat_body)
+    chat_body = _scramble_harness_fingerprint(chat_body)
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,

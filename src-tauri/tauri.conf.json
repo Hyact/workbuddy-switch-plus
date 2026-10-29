@@ -48,7 +48,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkyOTNCNDI4RjlCQkQ4NkEKUldScTJMdjVLTFNUa2pRWXhoQ3lkWDJCZ2FpaFVHWi9xUWRrMFVSVGZJb09YMHQ5MnNKTG5rUVkK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEEzQThFRTcxMDk4OEVENkEKUldScTdZZ0pjZTZvb3dFbWZ5U2xhZFRmSG0xNEYrZ2hLeW9hVjJjT3QxbFUwUmgyZnNuTVBLZGQK",
       "endpoints": [
         "https://github.com/Hyact/workbuddy-switch-plus/releases/latest/download/latest.json",
         "https://github.com/Hyact/workbuddy-switch-plus/releases/latest/download/latest-{{target}}-{{arch}}.json",
