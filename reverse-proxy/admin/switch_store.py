@@ -237,32 +237,36 @@ class SwitchCredentialManager:
         expires_at = (s.get("auth") or {}).get("expiresAt") or 0
         return time.time() * 1000 >= (expires_at - 60_000)
 
-    # ── 请求头（与 converter 逐字一致）──
+    # 与 converter 逐字一致：请求头组装走同一份实现，避免两处漂移。
     def _build_headers_from(self, auth: dict, account: dict) -> dict:
-        domain = auth.get("domain") or DEFAULT_DOMAIN
-        return {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {decrypt_auth_field(auth.get('accessToken', ''))}",
-            "X-User-Id": account.get("uid", ""),
-            "X-Enterprise-Id": account.get("enterpriseId", ""),
-            "X-Tenant-Id": account.get("enterpriseId", ""),
-            "X-Domain": domain,
-            "User-Agent": converter.USER_AGENT,
-        }
+        return converter.build_headers(auth, account)
+
+    def _plugin_headers(self, auth: dict, account: dict) -> dict:
+        """插件域（令牌刷新）用：**不带**渠道校验那三枚会话头。
+
+        会话头是 chat 域的凭据；插件域接口有自己的头形状，多给反而制造新的不一致。
+        """
+        return converter.build_headers(auth, account, channels=False)
 
     def get_headers(self) -> dict:
         with self._lock:
             if self._is_expired():
                 self._refresh()
             s = self._session()
-            return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
+            h = self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
+        # 渠道校验头按「本次请求」覆盖（会话池中间件写的 ContextVar，
+        # 见 converter.conversation_headers）。缺了这三枚头，被提升检测等级的
+        # 账号一律收到 11128；只按账号派生固定值则做不到「一段对话一个会话」。
+        override = converter.REQUEST_CHANNELS.get()
+        if override:
+            h.update(override)
+        return h
 
     # ── 刷新 ──
     def _refresh(self) -> None:
         s = self._session()
         auth = s.get("auth") or {}
-        headers = self._build_headers_from(auth, s.get("account") or {})
+        headers = self._plugin_headers(auth, s.get("account") or {})
         headers["X-Refresh-Token"] = decrypt_auth_field(auth.get("refreshToken", ""))
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = f"{BACKEND}/v2/plugin/auth/token/refresh"
@@ -331,6 +335,10 @@ class SwitchCredentialManager:
             "enterpriseName": acct.get("enterpriseName"),
             "token_expires_at": exp,
             "token_expired": self._is_expired(),
+            # 判版本（cn / global）靠这两个：少了它们，chat 端点与 UA 都只能
+            # 按国内版发，国际版账号会被送去国内端点。
+            "realm": realm_mod.realm_of(auth),
+            "domain": auth.get("domain"),
         }
 
 

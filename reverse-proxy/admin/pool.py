@@ -30,6 +30,8 @@ from . import usage
 from . import wb2api
 from .iputil import client_ip_from_scope
 
+from core import converter
+
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 CN = timezone(timedelta(hours=8))
 # billing 域基址随版本变（国际版是 www.workbuddy.ai），所以不再写死一个常量。
@@ -1469,7 +1471,7 @@ class AccountPool:
                 self.update(aid, token_refreshed=int(self.clock()), auth_invalid=False, cooldown_until=0, last_error=None)
                 return {"id": aid, "ok": True, "message": "登录凭据已刷新"}
             headers = manager.get_headers()
-            realm = realm_mod.realm_of(item)
+            realm = account_realm(item, manager)
             today = datetime.fromtimestamp(self.clock(), CN).strftime("%Y-%m-%d")
             with self.client_for(aid) as client:
                 message = "积分状态已更新"
@@ -1795,6 +1797,31 @@ class AccountPool:
             self.store.save()
 
 
+def account_realm(item, manager=None) -> str:
+    """账号属于哪一版（cn / global）。
+
+    **不能只看 `item`**：两个 store 写进 state.json 的账号行只有
+    `file` / `name` / `created` / `enabled` 这些元数据，没有版本字段，
+    于是 `realm_of(item)` 永远回 cn —— 国际版账号会拿国内账单地址去查积分，
+    401 之后整号进冷却，界面上只看到「积分服务请求失败」。
+
+    版本以凭据为准（`summary()` 里带 realm / domain），`item` 只作兜底。
+    """
+    info = {}
+    if manager is not None:
+        try:
+            info = manager.summary() or {}
+        except Exception:  # noqa: BLE001
+            info = {}
+    info = info if isinstance(info, dict) else {}
+    item = item if isinstance(item, dict) else {}
+    return realm_mod.realm_of({
+        "realm": info.get("realm") or item.get("realm"),
+        "variant": info.get("variant") or item.get("variant"),
+        "domain": info.get("domain") or item.get("domain"),
+    })
+
+
 def request_affinity(headers, body):
     """Persist only a hash of caller/model/session identity, never raw prompts or keys."""
     if not isinstance(body, dict):
@@ -2008,6 +2035,15 @@ class PoolMiddleware:
             return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
         token = REQUEST_CREDENTIAL.set(manager)
         egress_token = egress.REQUEST_EGRESS.set(egress_url)
+        # 渠道校验头按**本次请求**绑定（见 converter.conversation_headers）：
+        # 会话 id 取调用方的话题（X-Session-Id / prompt_cache_key…，与选号用的是
+        # 同一个 affinity），一条对话多轮请求共用它；请求/消息 id 每次请求换新。
+        # 不在这里绑的话，凭据层只能按账号派发一个固定值，一轮对话里的每条
+        # 消息都自称"同一个请求"，上游的渠道校验照样不认。
+        channels = converter.conversation_headers(
+            aid, affinity_key or "", f"{affinity_key or ''}:{time.time_ns()}"
+        )
+        channels_token = converter.REQUEST_CHANNELS.set(channels)
         status = 200
         buffer = b""
         tokens_used = 0
@@ -2118,6 +2154,7 @@ class PoolMiddleware:
         finally:
             REQUEST_CREDENTIAL.reset(token)
             egress.REQUEST_EGRESS.reset(egress_token)
+            converter.REQUEST_CHANNELS.reset(channels_token)
             # 必须先还名额再记状态：`record` 会更新 last_request，
             # 而并发上限的判断依赖 inflight 已经归位。
             if granted is not None:

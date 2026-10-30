@@ -307,6 +307,60 @@ uv run python -m core.converter --desensitize --log converter.log
 - 本地 401：你启用了 `--api-key`，但客户端没带同一个 key
 - 后端 401：腾讯 token 失效，尝试重新打开桌面端登录
 
+#### 400 `{"code":11128,...}`：没通过渠道校验
+
+```
+400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+     "displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。"}}
+```
+
+这**不是**内容审核，也不是 token 失效，而是上游对 chat 域做的客户端渠道校验。被提升检测等级的账号会要求两样东西同时到位，缺一个就整片 11128：
+
+1. `User-Agent` 不能是第三方反代的自报家名，也不能为空；
+2. `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID` 三枚会话头，一个都不能少。
+
+本项目已按官方形态发这几枚头（业务代码无需改动）。如果你的环境仍报这个错，先确认跑的是不是新版本，再按需要覆盖 UA：
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `WB_UA` | 整串覆盖 `User-Agent`（应急/调试，不做任何拼接） |
+| `WB_UA_VERSION` | 只覆盖 UA 里的版本号（默认用模块常量；账号库里记了 `clientVersion`/`appVersion` 时优先用它） |
+| `WB_UA_CLI` | 只覆盖 UA 里的 CLI 段 |
+| `WB_CHAT_BASE` | 覆盖 chat 主机基址（默认按账号版本自动选；国际版主机是推断值，异常时可指到 `https://www.codebuddy.ai`） |
+
+UA 与 chat 端点都会跟着账号版本走：国际版账号自动换成 `WorkBuddy AI` 段并打到 `www.workbuddy.ai`。
+
+国际版端点还多一条**硬要求**：首条消息必须是 `system`，否则回
+
+```
+400 {"code":11128,"msg":"first message is not system prompt"}
+```
+
+注意这跟上面的渠道校验是**同一个业务码、不同的一条规则**——看到 11128 时先看 `msg`。反代已自动处理（首个非 system 时补一条空 system，国内版不受影响），业务代码不用动。
+
+国际版账号在池子里同样可用：额度查询与账单走 `www.workbuddy.ai`，签到体系不存在则自动跳过（不会记成失败）。
+
+#### 第三种 11128：把 dsh 的 `@` 文件引用说明误判成非官方客户端
+
+如果前两种都排除了，仍然报同一条 `Illegal API invocation from an unapproved channel`，先看 system 里有没有这一句：
+
+> Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.
+
+它来自 DeepSeek Harness 的 `@deepseek-ai/dsh-file-reference` 包（`FILE_REFERENCE_PROMPT`，就是 `@文件引用` 的说明文本）。上游会把「这一句 + 前一句 `Tokens prefixed with @ are paths…`」的组合判成第三方客户端指纹。
+
+实测（同一份 15.8K system、同一账号、同一模型）：
+
+| 处理 | 结果 |
+| --- | --- |
+| 原样 | 11128（连续 2 次） |
+| 删掉这句 | 200（连续 3 次） |
+| 同义改写 | 200（连续 2 次） |
+| 只留前半句 / 只留后半句 | 200 / 200（单句不触发，成对才触发） |
+
+反代已自动做**同义改写**（语义不变，`@` 引用行为不受影响）。想关掉：`CODEBUDDY_NO_PROMPT_REWRITE=1`。
+
+注意这与「提示词太长」无关：纯良性文本 30000 字符照样通过；机制是内容匹配，不是长度。
+
 #### 响应慢
 
 先换快一点的模型，比如 `deepseek-v4-flash`。

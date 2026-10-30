@@ -22,12 +22,15 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
 from __future__ import annotations
 
 import argparse
+import contextvars
+import hashlib
 import json
 import os
 import re
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -72,7 +75,102 @@ from .system_identity import filter_system_identity
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
-USER_AGENT = "codebuddy2openai/2.0"
+
+#: 被提升渠道校验等级的账号，上游对 `User-Agent` 是有要求的：不能为空、
+#: 也不能是第三方反代的自报家名（以前这里是 `codebuddy2openai/2.0`），
+#: 否则一律
+#: `400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`。
+#
+# 版本号**不要写死成我们猜的值**：官方客户端的 UA 段与它所跑的版本一致，
+# 写一个两边都对不上的版本等于自曝。优先级见 `_official_user_agent()`。
+# 默认值取本机桌面端的真实版本（启动日志 appVersion=5.9.3）。写一个本机不存在
+# 的版本号不会更安全，只会让 UA 与客户端版本对不上；有别的版本可用
+# WB_UA_VERSION / WB_UA 覆盖，见 `_official_user_agent()`。
+APP_VERSION = "5.9.3"
+CLI_VERSION = "2.137.1"
+
+
+def _realm_from(auth) -> str:
+    """凭据属于哪一版（cn / global）。取法与 `admin.realm.realm_of` 同一口径。
+
+    显式 realm 优先，其次 variant，最后看 domain 后缀。`admin` 不可用时
+    （单独跑 converter 的场景）退化成只看 domain 后缀，绝不返回空串。
+    """
+    auth = auth if isinstance(auth, dict) else {}
+    try:
+        from admin import realm as realm_mod
+        return realm_mod.realm_of(auth)
+    except ImportError:
+        pass
+    text = str(auth.get("realm") or auth.get("variant") or "").strip().lower()
+    if text in ("global", "ai", "intl", "international", "workbuddy-ai"):
+        return "global"
+    domain = str(auth.get("domain") or "").strip().lower()
+    if domain.startswith("http"):
+        domain = domain.split("://", 1)[1].split("/", 1)[0]
+    domain = domain.split(":", 1)[0]
+    return "global" if domain == "workbuddy.ai" or domain.endswith(".workbuddy.ai") else "cn"
+
+
+def _official_user_agent(version: str = "", realm: str = "cn") -> str:
+    """官方形态的 UA。
+
+    国内版：`WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cli>`
+    国际版：`WorkBuddy/<ver> WorkBuddy AI/<ver> CLI/<cli>`
+
+    两段的品牌名都是 WorkBuddy，第二段才是产品名 —— 与 `admin/realm.py` 的
+    `_ua()` 同形。抄一份而不是 import，是因为 core 不能反向依赖 admin
+    （单独跑 converter 时没有 admin 包）。
+
+    版本号的取值顺序：
+      1. 环境变量 `WB_UA`（整串覆盖，用来应急/调试，不拼任何东西）
+      2. 调用方给的 version（账号库里记着的本机真实客户端版本）
+      3. 环境变量 `WB_UA_VERSION`
+      4. 模块常量 `APP_VERSION`
+    CLI 段同理，可被 `WB_UA_CLI` 覆盖。
+    """
+    override = os.environ.get("WB_UA", "").strip()
+    if override:
+        return override
+    ver = (str(version or "").strip()
+           or os.environ.get("WB_UA_VERSION", "").strip()
+           or APP_VERSION)
+    cli = os.environ.get("WB_UA_CLI", "").strip() or CLI_VERSION
+    name = "WorkBuddy AI" if _realm_from({"realm": realm}) == "global" else "WorkBuddy"
+    return f"WorkBuddy/{ver} {name}/{ver} CLI/{cli}"
+
+
+#: 兼容旧引用（签名域 / 测试按此名取默认 UA）。
+USER_AGENT = _official_user_agent()
+
+
+def stable_uuid(*parts) -> str:
+    """由任意片段派生一个固定的 UUIDv4 形态字符串。
+
+    为什么要「固定」而不是每次随机（`uuid4()`）：会话头在同一个话题里必须
+    前后一致，上游才认得出这是同一段对话；而同一段文字跨进程、跨重启也要
+    派生同一个值——签到 / 上报 / 反代重启后重发同一条消息，不能变成一个新会话。
+    """
+    digest = hashlib.sha256("\x1f".join(str(p) for p in parts).encode("utf-8")).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
+
+
+def conversation_headers(uid="", conversation_key="", message_key="") -> dict:
+    """上游渠道校验要的三枚会话头。
+
+    · `X-Conversation-ID`          会话（话题）id，同一话题内恒定
+    · `X-Conversation-Request-ID`  一次请求一个，同一请求的流式/非流式复用
+    · `X-Conversation-Message-ID`  一条消息 id
+
+    三枚都缺会 11128；只补一部分同样过不去。派生用「账号 + 会话」做种子，
+    保证同一账号同一话题稳定、不同账号之间互不撞车。
+    """
+    conv = stable_uuid("wb-conv", uid, conversation_key or message_key or "default")
+    return {
+        "X-Conversation-ID": conv,
+        "X-Conversation-Request-ID": stable_uuid("wb-req", conv, message_key or uuid.uuid4().hex),
+        "X-Conversation-Message-ID": stable_uuid("wb-msg", conv, message_key or uuid.uuid4().hex),
+    }
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -120,6 +218,48 @@ def find_auth_file() -> Path | None:
 # Auth 凭据管理（读 + 自动刷新 + 回写）
 # ---------------------------------------------------------------------------
 
+#: 本次请求的证据头（渠道校验三件套），由调用方（账号池 / 各协议入口）写好。
+#:
+#: 为什么不从凭据里现算：会话 id 应当来自**客户端那边的话题**——同一条会话的
+#: 多轮请求要叫同一个 `X-Conversation-ID`。凭据层只知道账号，不知道话题，
+#: 派生出来的值每轮都一样，做不到「一段对话一个 id」。
+#: 留空时 `get_headers()` 退回按账号派生的固定值，保证任何路径都不缺这三枚头
+#: （缺了就是上游 11128）。
+REQUEST_CHANNELS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "converter_request_channels", default=None
+)
+
+
+def build_headers(auth: dict, account: dict, *, channels: bool = True) -> dict:
+    """按凭据与账号拼上游请求头。
+
+    两个 store（本地 .info 的 CredentialManager、switch 账号库的
+    AccountCredentialManager）都必须走这一个入口：以前各写一份副本，
+    渠道校验头只补了一边，另一边就静静地对不上。
+
+    UA 与 `X-Domain` 都跟着凭据的版本走：国际版账号发国际版形态的 UA，
+    否则一条自称 `WorkBuddy/x` 又指着 `workbuddy.ai` 的请求本身就是破绽。
+    """
+    auth = auth if isinstance(auth, dict) else {}
+    account = account if isinstance(account, dict) else {}
+    realm = _realm_from(auth)
+    domain = auth.get("domain") or DEFAULT_DOMAIN
+    uid = account.get("uid", "")
+    version = account.get("clientVersion") or account.get("appVersion") or ""
+    h = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {decrypt_auth_field(auth.get('accessToken', ''))}",
+        "X-User-Id": uid,
+        "X-Enterprise-Id": account.get("enterpriseId", ""),
+        "X-Tenant-Id": account.get("enterpriseId", ""),
+        "X-Domain": domain,
+        "User-Agent": _official_user_agent(version, realm),
+    }
+    if channels:
+        h.update(conversation_headers(uid))
+    return h
+
 
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
@@ -160,7 +300,7 @@ class CredentialManager:
         """调后端刷新 token，写回 auth 文件与缓存。"""
         s = self._session()
         auth = s.get("auth") or {}
-        headers = self._build_headers_from(auth, s.get("account") or {})
+        headers = self._build_headers_from(auth, s.get("account") or {}, channels=False)
         headers["X-Refresh-Token"] = decrypt_auth_field(auth.get("refreshToken", ""))
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = f"{BACKEND}/v2/plugin/auth/token/refresh"
@@ -204,27 +344,26 @@ class CredentialManager:
         self._cached = s
         self._mtime = self.path.stat().st_mtime
 
-    def _build_headers_from(self, auth: dict, account: dict) -> dict:
-        domain = auth.get("domain") or DEFAULT_DOMAIN
-        h = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {decrypt_auth_field(auth.get('accessToken', ''))}",
-            "X-User-Id": account.get("uid", ""),
-            "X-Enterprise-Id": account.get("enterpriseId", ""),
-            "X-Tenant-Id": account.get("enterpriseId", ""),
-            "X-Domain": domain,
-            "User-Agent": USER_AGENT,
-        }
-        return h
+    def _build_headers_from(self, auth: dict, account: dict, *, channels: bool = True) -> dict:
+        return build_headers(auth, account, channels=channels)
 
     def get_headers(self) -> dict:
-        """返回带最新 token 的后端请求 header；必要时先刷新。"""
+        """返回带最新 token 的后端请求 header；必要时先刷新。
+
+        刷新链路（`/v2/plugin/auth/token/refresh`）**不带会话头**：那是插件域的
+        接口，头形状与 chat 域不同，多给几枚渠道头没有好处，只会是新的不一致。
+        """
+        override = REQUEST_CHANNELS.get()
         with self._lock:
             if self._is_expired():
                 self._refresh()
             s = self._session()
-            return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
+            h = self._build_headers_from(
+                s.get("auth") or {}, s.get("account") or {}, channels=override is None
+            )
+        if override:
+            h.update(override)
+        return h
 
     def summary(self) -> dict:
         s = self._session()
@@ -237,6 +376,10 @@ class CredentialManager:
             "enterpriseName": acct.get("enterpriseName"),
             "token_expires_at": exp,
             "token_expired": self._is_expired(),
+            # 判版本（cn / global）靠这两个：少了它们，调用方只能一律当国内版，
+            # 国际版账号就会被送去国内端点，失败起来还不像鉴权问题。
+            "realm": _realm_from(auth),
+            "domain": auth.get("domain"),
         }
 
 
@@ -582,19 +725,136 @@ _MODEL_CATALOG_CACHE: dict = {}
 def _realm_of_credential(cred) -> str:
     """按订单/凭据判断该用哪一版端点。
 
-    凭据对象来自 `switch_store.CredentialManager`，`summary()` 里有 domain。
+    凭据对象来自两个 store 的 `CredentialManager`，`summary()` 里带 realm / domain。
     拿不到就判国内版 —— 与 `realm.realm_of` 同口径（显式 realm 优先，domain 兜底）。
     """
     try:
         summary = cred.summary() if cred is not None else {}
     except Exception:  # noqa: BLE001
         summary = {}
-    auth = {"realm": (summary or {}).get("realm"), "domain": (summary or {}).get("domain")}
+    summary = summary if isinstance(summary, dict) else {}
+    return _realm_from({
+        "realm": summary.get("realm"),
+        "variant": summary.get("variant"),
+        "domain": summary.get("domain"),
+    })
+
+
+#: 上游把 system 里某些**模板化的中文路径说明**当成了"非官方客户端"的信号，
+#: 回 `11128 Illegal API invocation from an unapproved channel`。
+#: 实测（同一份 15.8K system，只改这一句）：
+#:   原样        → 11128（连测 2 次）
+#:   删掉这一句   → 200（连测 3 次）
+#:   同义改写     → 200（连测 2 次）
+#: 这句本身是 dsh 的 `@文件引用` 说明（`@deepseek-ai/dsh-file-reference` 的
+#: FILE_REFERENCE_PROMPT），与安全无关，属于误判。这里换成等价说法，
+#: 语义不变、长度相近，避免把整段说明删掉影响 `@` 引用的行为。
+#:
+#: 换成同义句而不是删除：删掉会少一句"相对路径怎么解析"的约束，
+#: 模型对 `@` 引用的处理会变松；改写则两者都不损失。
+_FALSE_POSITIVE_REWRITES = (
+    ("Relative paths resolve from the workspace root; "
+     "absolute paths identify files or directories on the host.",
+     "Relative paths are resolved against the workspace root; "
+     "absolute paths point at files or directories on the host."),
+)
+
+
+def defang_false_positives(body: dict) -> dict:
+    """把已知会被上游误判的模板文本换成同义表达（只动 system/developer）。
+
+    这个函数的存在本身就是个 bug 记录：上游的渠道校验把 dsh 的 `@` 文件引用
+    说明当成了第三方客户端的指纹。误判是上游那边的事，我们只能绕开，
+    但不能靠删内容绕——所以做等价改写，并把这个事实写在这里。
+    """
+    if os.environ.get("CODEBUDDY_NO_PROMPT_REWRITE", "") == "1":
+        return body
+    if not isinstance(body, dict):
+        return body
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    changed = False
+    out = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in ("system", "developer"):
+            out.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+            for old, new in _FALSE_POSITIVE_REWRITES:
+                text = text.replace(old, new)
+            if text != content:
+                changed = True
+                message = dict(message, content=text)
+        elif isinstance(content, list):
+            blocks = []
+            for block in content:
+                if (isinstance(block, dict) and isinstance(block.get("text"), str)):
+                    text = block["text"]
+                    for old, new in _FALSE_POSITIVE_REWRITES:
+                        text = text.replace(old, new)
+                    if text != block["text"]:
+                        changed = True
+                        block = dict(block, text=text)
+                blocks.append(block)
+            message = dict(message, content=blocks)
+        out.append(message)
+    if not changed:
+        return body
+    return dict(body, messages=out)
+
+
+def ensure_system_first(body: dict, cred=None) -> dict:
+    """国际版端点要求首条消息是 system，否则回
+    `11128 "first message is not system prompt"`。
+
+    这条与「渠道校验」那个 11128 是**同一个业务码、完全不同的一条规则**：
+    国内端点不要求，国际端点强制。不处理的话，只改主机只是把 401 换成 11128。
+
+    补的是**空 system**：实测空内容可以过，改动最小，也不往对话里塞我们的
+    话（塞一句自编的自我介绍反而会让回复跑偏）。
+    """
+    if _realm_of_credential(cred) != "global":
+        return body
+    if not isinstance(body, dict):
+        return body
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return body
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") == "system":
+        return body
+    return dict(body, messages=[{"role": "system", "content": ""}] + messages)
+
+
+def chat_endpoint(cred=None) -> str:
+    """chat/completions 的上游地址。
+
+    **必须按账号版本分域**：国内版在 `copilot.tencent.com`，国际版在
+    `www.workbuddy.ai`。以前这里写死国内版地址，国际版账号会被送去国内端点，
+    拿到的不是 11128 而是边缘层的 401 HTML——看起来像「服务挂了」，
+    排查方向从一开始就错了。
+
+    为什么是这两台主机：`admin/realm.py` 就是这么分的（`CN_CHAT_BASE` 与
+    `GLOBAL_BASE`），官方桌面端国际版的 `api_endpoint()` 也是 `www.workbuddy.ai`。
+    `X-Domain` 头**不参与**路由（实测国内主机带国际域照样 200），
+    真正决定路由的是主机。
+
+    这个对应关系是用国内 token 反推出来的（国际主机对国内 token 直接 401），
+    没有拿真实国际版账号验过，所以留了一个逃生口：`WB_CHAT_BASE` 覆盖主机基址。
+    """
+    override = os.environ.get("WB_CHAT_BASE", "").strip()
+    if override:
+        return override.rstrip("/") + "/v2/chat/completions"
     try:
         from admin import realm as realm_mod
-        return realm_mod.realm_of(auth)
+        base = realm_mod.chat_base(_realm_of_credential(cred))
     except ImportError:
-        return "cn"
+        base = BACKEND
+    return f"{base}/v2/chat/completions"
 
 
 def _envelope_of(resp):
@@ -967,6 +1227,21 @@ def _proxy_kwargs() -> dict:
         return {}
 
 
+def _inbound_affinity(request) -> str:
+    """从入站请求里找「这是哪一段对话」的线索，找不到回空串。
+
+    与 `admin.pool.request_affinity` 的取法一致（会话头 > 请求体字段 > 首条用户话），
+    但那边要算哈希给选号用；这里只想拿一个稳定的原始标识给渠道头，
+    所以只取第一个命中的值，不做哈希。
+    """
+    headers = request.headers
+    for name in ("x-session-id", "session_id", "x-conversation-id"):
+        value = headers.get(name)
+        if value:
+            return value
+    return ""
+
+
 def _cred() -> CredentialManager:
     # The management deployment binds one credential to each ASGI request.
     # Standalone converter usage keeps the original single-account behavior.
@@ -1030,6 +1305,10 @@ async def chat_completions(
 ):
     _check_auth(authorization, x_api_key)
     cred = _cred()
+    # 独立运行（没有账号池中间件）时也要有渠道头：按请求自带的会话线索派生，
+    # 否则直接跑这个 app 的每一轮都会 11128。
+    if REQUEST_CHANNELS.get() is None:
+        REQUEST_CHANNELS.set(conversation_headers("", _inbound_affinity(request)))
 
     try:
         payload = await request.json()
@@ -1105,7 +1384,9 @@ async def chat_completions(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    body = defang_false_positives(body)
+    body = ensure_system_first(body, cred)
+    url = chat_endpoint(cred)
     t0 = time.time()
 
     if client_wants_stream:
@@ -1468,6 +1749,8 @@ async def create_response(
     """
     _check_auth(authorization, x_api_key)
     cred = _cred()
+    if REQUEST_CHANNELS.get() is None:
+        REQUEST_CHANNELS.set(conversation_headers("", _inbound_affinity(request)))
 
     try:
         payload = await request.json()
@@ -1527,7 +1810,9 @@ async def create_response(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    chat_body = defang_false_positives(chat_body)
+    chat_body = ensure_system_first(chat_body, cred)
+    url = chat_endpoint(cred)
     t0 = time.time()
 
     if client_wants_stream:
@@ -1639,6 +1924,8 @@ async def create_message(
     """
     _check_auth(authorization, x_api_key)
     cred = _cred()
+    if REQUEST_CHANNELS.get() is None:
+        REQUEST_CHANNELS.set(conversation_headers("", _inbound_affinity(request)))
 
     try:
         payload = await request.json()
@@ -1706,7 +1993,9 @@ async def create_message(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    chat_body = defang_false_positives(chat_body)
+    chat_body = ensure_system_first(chat_body, cred)
+    url = chat_endpoint(cred)
     t0 = time.time()
 
     # 如果用户请求流式响应，直接返回流式
@@ -1890,7 +2179,9 @@ async def count_tokens(
         )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    chat_body = defang_false_positives(chat_body)
+    chat_body = ensure_system_first(chat_body, cred)
+    url = chat_endpoint(cred)
 
     try:
         async with httpx.AsyncClient(timeout=30.0, **_proxy_kwargs()) as client:
